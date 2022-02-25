@@ -31,6 +31,15 @@ b_P12 = 1.6*np.sqrt(3.0)*np.pi/40.0**0.5
 # Unit conversion factors
 avir_conv = ((1.0*au.km/au.s)**2*au.pc/(ac.G*au.M_sun)).to('').value
 
+# Resolution of Dame et al. survey is 8.5 argmin, so rbeam = 2.47 (d/kpc) pc
+rbeam_conv = (8.5*au.arcmin).cgs.value*(1.0*au.kpc).to('pc').value
+
+# Solid angle of a single pixel in MD17
+dOmega = 4.76e-6
+
+# Core-to-star efficiency
+eps_cs_def = 0.3
+
 ###########################################
 # Functions calculating abundance gradient
 ###########################################
@@ -103,6 +112,27 @@ def get_XCO10(Z, XCO10_0, a):
     XCO10 = XCO10_0*Z**(-a)*au.cm**-2*(au.K*au.km/au.s)**-1
     return XCO10.value
 
+def get_XCO10_Gong4a(Z, a, WCO, rbeam, XCO10_0=6.1e20):
+    """Compute XCO
+    """
+    try:
+        Z = Z.values
+    except AttributeError:
+        pass
+    try:
+        WCO = WCO.values
+    except AttributeError:
+        pass
+    try:
+        rbeam = rbeam.values
+    except AttributeError:
+        pass
+
+    XCO10 = XCO10_0*Z**(-a)*rbeam**(-0.25)*WCO**(-0.54+0.19*np.log10(rbeam))*\
+      au.cm**-2*(au.K*au.km/au.s)**-1
+    return XCO10.value
+
+
 def get_alphaCO10_Lada20(Rgal, muH2=muH2_def):
     """Compute alphaCO suggested by Lada & Dame 2020
     """
@@ -121,8 +151,7 @@ def get_epsff(avir, b):
 def get_epsff_step(avir, avir_crit=2.0):
     return np.where(avir > avir_crit, 0.0, 1.0)
 
-
-def get_SFR(M, R, avir, b=2.018, eps_cs=0.3):
+def get_SFR(M, R, avir, b=2.018, eps_cs=eps_cs_def):
     """Get SFR of a single cloud in units of Msun/yr
     """
     cl = Cloud(M, R)
@@ -177,11 +206,15 @@ def read_MD17_Table1(fname='./MD17/MD17-Table1.txt', force_download=False):
 
     # Virial parameter (based on raw data)
     df0['avir_orig'] = 5.0*df0['sigmav']**2*df0['R']/df0['M_orig']*avir_conv
+    df0['rbeam'] = rbeam_conv*df0['D']
     
     return df0
 
+
+###########################
+
 def get_SFR_all_MD17(df, a, b, XCO10_0=2.0e20, muH2=muH2_def, get_Z_function=get_Z_MW_MD22,
-                     Rgal0=Rgal0_def, eps_cs=0.3, avir_cut=100, Rgal_cut=30.0, M_cut=1.0,
+                     Rgal0=Rgal0_def, eps_cs=eps_cs_def, avir_cut=100, Rgal_cut=30.0, M_cut=1.0,
                      cut_before=True, verbose=False):
     """
     Function to calculate theoretical SFR_th and other quantities based on Z-dependent alphaCO
@@ -211,19 +244,25 @@ def get_SFR_all_MD17(df, a, b, XCO10_0=2.0e20, muH2=muH2_def, get_Z_function=get
         #     print('Excluded mass (fraction)', (df__['M_orig'].sum() - df['M_orig'].sum())/df['M_orig'].sum())
         #     print('# of clouds before and after cut:', len(df__), len(df))
             
-    # solid angle of a single pixel in MD17
-    dOmega=4.76e-6
     
     mu = muH2*(1.008*au.u)
 
     ## Metallicity gradient and X_CO variation with Rgal
     # Compute Metallicity
     # Q: shouldn't we update Rgal information as well?
-    df['Z'] = get_Z_function(df['Rgal'], Rgal0=Rgal0)
 
-    # alpha_CO and XCO
-    df['alpha_CO'] = get_alphaCO10(df['Z'], XCO10_0=XCO10_0, muH2=muH2, a=a)
-    df['XCO'] = get_XCO10(df['Z'], XCO10_0=XCO10_0, a=a)
+    if get_Z_function == 'Lada20':
+        df['alpha_CO'] = get_alphaCO10_Lada20(df['Rgal'], muH2=muH2)
+        df['XCO'] = (df['alpha_CO'].values*(au.M_sun/au.pc**2/au.K/au.km*au.s)/\
+                     (muH2_def*mH)).to('cm-2 K-1 km-1 s').value
+    elif get_Z_function == 'Gong4a':
+        df['Z'] = get_Z_MW_MD22(df['Rgal'], Rgal0=Rgal0)
+        df['XCO'] = get_XCO10_Gong4a(df['Z'], a, df['WCO']/df['Npix'], df['rbeam'])
+    else:
+        df['Z'] = get_Z_function(df['Rgal'], Rgal0=Rgal0)
+        # alpha_CO and XCO
+        df['alpha_CO'] = get_alphaCO10(df['Z'], XCO10_0=XCO10_0, muH2=muH2, a=a)
+        df['XCO'] = get_XCO10(df['Z'], XCO10_0=XCO10_0, a=a)
 
     # Recalculate NH2m Sigma, M, and other properties using
     # Eq 14 in MD17 (note that our mu is their 2mu)
@@ -253,8 +292,9 @@ def get_SFR_all_MD17(df, a, b, XCO10_0=2.0e20, muH2=muH2_def, get_Z_function=get
     
     # SFR with epsff and eps_cs factors
     df['SFR'] = eps_cs*df['SFR0']*df['epsff']
-    df['SFR_step'] = eps_cs*df['SFR0']*df['epsff_step']
-
+    #df['SFR_step'] = eps_cs*df['SFR0']*df['epsff_step']
+    df['SFR_step'] = df['SFR0']*df['epsff_step']
+    
     if not cut_before:
         # Apply cut after
         import copy
@@ -319,24 +359,29 @@ def plt_MD17_contour_S():
     # cmap = plt.cm.RdBu_r
     #cmap = plt.cm.RdBu
     cmap = cmocean.cm.balance
+    from matplotlib.patheffects import withStroke
+    myeffect = withStroke(foreground='w', linewidth=3)
 
     norm = LogNorm(1/30.0,30.0)
-    titles = [r'$X_{\rm CO,0}=1.4\times 10^{20}\;[{\rm cm}^{-2}\,({\rm K}\,{\rm km}\,{\rm s}^{-1})^{-1}]$',
-              r'$X_{\rm CO,0}=2.0\times 10^{20}\;[{\rm cm}^{-2}\,({\rm K}\,{\rm km}\,{\rm s}^{-1})^{-1}]$']
+    titles = [r'$X_{\rm CO,0}=1.4\times 10^{20}\,{\rm cm}^{-2}\,({\rm K}\,{\rm km}\,{\rm s}^{-1})^{-1}$',
+              r'$X_{\rm CO,0}=2.0\times 10^{20}\,{\rm cm}^{-2}\,({\rm K}\,{\rm km}\,{\rm s}^{-1})^{-1}$']
     im = []
-    
+    lw = 2
     for i,(ax,r,title) in enumerate(zip((axes[0],axes[1]),(r0,r1),titles)):
         plt.sca(ax)
-        im_ = plt.pcolormesh(r['a'], r['b'], r['SFRtot'].T/SFRtot_obs, norm=norm, cmap=cmap,
-                             antialiased=True, linewidth=0)
-        ct = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
-                         [0.02,50.0], linestyles='-.', colors='dimgrey', linewidths=2.5)
-        ct = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
-                         [0.1,10.0], linestyles='--', colors='dimgrey', linewidths=2.5)
-        ct = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
-                         [0.5,2.0], linestyles=':', colors='dimgrey', linewidths=2.5)
-        ct = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
-                         [1.0], linestyles='-', colors='dimgrey', linewidths=2.5)
+        im_ = plt.pcolormesh(r['a'], r['b'], r['SFRtot'].T/SFRtot_obs, norm=norm, cmap=cmap, shading='auto')
+        ct1 = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
+                          [1/30.0,30.0], linestyles='--', colors='dimgrey', linewidths=lw)
+        ct2 = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
+                          [1/10.0,10.0], linestyles='--', colors='dimgrey', linewidths=lw)
+        ct3 = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
+                          [1/3.0,3.0], linestyles='--', colors='dimgrey', linewidths=lw)
+        # Q_th=1
+        ct4 = plt.contour(r['a'],r['b'],r['SFRtot'].T/SFRtot_obs,
+                          [1.0], linestyles='-', colors='k', linewidths=lw+0.5)
+
+        ax.clabel(ct4,ct4.levels,inline=True,fmt=r'$Q_{\rm th}=1$', fontsize=18,
+                  manual=[(1.8,2.2)])
 
         plt.axhline(b_KOF21, lw=1, ls='-',c='k')
         plt.axhline(b_P12, lw=1, ls='-',c='k')
@@ -345,19 +390,21 @@ def plt_MD17_contour_S():
         plt.xlim(0,2)
         plt.ylim(0,3)
         plt.title(title)
-        plt.xlabel(r'$a$', fontsize='large') #$\;\;(\alpha_{\rm CO} = \alpha_{\rm CO,0}Z^{-a})$')
-        plt.ylabel(r'$b$', fontsize='large') # $\;\;(\varepsilon_{\rm ff} = \exp (-b \alpha_{\rm vir}^{1/2}))$')
+        plt.xlabel(r'$a$', fontsize='x-large') #$\;\;(\alpha_{\rm CO} = \alpha_{\rm CO,0}Z^{-a})$')
+        plt.ylabel(r'$b$', fontsize='x-large') # $\;\;(\varepsilon_{\rm ff} = \exp (-b \alpha_{\rm vir}^{1/2}))$')
 
         im.append(im_)
 
     cb = plt.colorbar(mpl.cm.ScalarMappable(norm=norm, cmap=cmap),
-                      cax=axes[2], orientation='vertical', extend='both',
-                      label=r'$S \equiv {\rm SFR}_{\rm th}/{\rm SFR}_{\rm obs}$')
+                      cax=axes[2], orientation='vertical', extend='neither',
+                      label=r'$Q_{\rm th} \equiv {\rm SFR}_{\rm th}/{\rm SFR}_{\rm obs}$')
 
-    axes[0].text(0.02,2.05,r'$b_{\rm KOF}$')
-    axes[0].text(0.02,1.4,r'$b_{\rm PN}$')
-    axes[0].text(0.81,0.7,r'$a_{\rm Gong}$')
-    axes[0].text(1.61,0.7,r'$a_{\rm Accurso}$')
+    fs = 20
+    for ax in axes[0:-1]:
+        ax.text(0.02,2.07,r'$b_{\rm KOF}$',fontsize=fs, path_effects=[myeffect])
+        ax.text(0.02,1.42,r'$b_{\rm PN}$',fontsize=fs, path_effects=[myeffect])
+        ax.text(0.81,0.72,r'$a_{\rm Gong}$',fontsize=fs, path_effects=[myeffect])
+        ax.text(1.61,0.72,r'$a_{\rm Sun}$',fontsize=fs, path_effects=[myeffect])
 
     fname = osp.join(osp.expanduser('~'),
            'Dropbox/Apps/Overleaf/SFRModels (MW)/figures/fig-S-contour.png')
@@ -366,6 +413,39 @@ def plt_MD17_contour_S():
     r = dict(fig=fig, r0=r0, r1=r1, im=im)
 
     return r
+
+def get_Sigma_SFR_KE12(SFR_tot_norm=SFRtot_obs):
+    
+    Rgal = np.array([1,3,5,7,9,11,13,15])
+    log_Sigma_SFR = np.array([0.25,0.44,0.65,0.45,0.4,0.2,0.046,-0.5])
+    Sigma_SFR = 10.0**log_Sigma_SFR
+    
+    Area = np.pi*Rgal**2
+    dArea = np.zeros_like(Area)
+    dArea[0] = Area[0]
+    dArea[1:] = Area[1:] - Area[:-1]
+
+    SFR_ = dArea*Sigma_SFR
+    # normalize so that the total SFR matches the observed rate
+    SFR = SFR_tot_norm*SFR_/SFR_.sum()
+    fac = SFR_tot_norm/SFR_.sum()
+    Sigma_SFR = fac*Sigma_SFR
+    
+    r = dict()
+    r['Rgal'] = Rgal
+    r['Sigma_SFR'] = Sigma_SFR
+    r['dArea'] = dArea
+    r['norm_fac'] = fac
+    r['SFR'] = dArea*Sigma_SFR
+    r['SFR_tot'] = (dArea*Sigma_SFR).sum()
+    
+    return r
+
+
+
+
+
+
 
 if __name__ == '__main__':
 
